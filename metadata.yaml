@@ -1,0 +1,12 @@
+name: astrbot_plugin_student_assistant
+desc: >-
+  学院团学事务智能沟通小助手。学生自助问答由 AstrBot 原生知识库（RAG）完成，
+  本插件补齐原生能力做不到的业务闭环：自动收集知识库无法解答的学生提问，
+  供工作人员汇总补充资料；管理员可在群内发送网页链接一键抓取入库；
+  提供 /未答列表、/未答解决、/知识库状态 等管理指令。
+version: 0.1.0
+author: echosnow
+repo: https://github.com/echosnow/astrbot_plugin_student_assistant
+display_name: 团学事务智能助手
+short_desc: 知识库自助问答的业务闭环：未答问题自动收集汇总 + 群内链接一键入库。
+astrbot_version: ">=4.5.7,<5"

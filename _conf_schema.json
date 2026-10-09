@@ -1,0 +1,26 @@
+{
+  "kb_name": {
+    "description": "知识库名称",
+    "type": "string",
+    "default": "团学事务知识库",
+    "hint": "AstrBot WebUI「知识库」页面中创建的知识库名称，需与名称完全一致（AstrBot 版本 >= 4.5.0，且已配置嵌入模型，推荐硅基流动 BAAI/bge-m3）。/加入知识库 与 /知识库状态 均使用该名称。"
+  },
+  "allowed_groups": {
+    "description": "允许插件工作的群聊标识列表",
+    "type": "list",
+    "default": [],
+    "hint": "留空时机器人所在的所有群都生效。QQ 官方机器人请填写群的 group_openid，OneBot 请填写群号（可在群内发送 /我是谁 查看，例如 [\"ABCD1234\"]）。"
+  },
+  "question_keywords": {
+    "description": "判定「像提问」的关键词",
+    "type": "list",
+    "default": ["？", "?", "怎么", "如何", "哪里", "啥", "为什么", "什么时候", "多久", "多少", "能不能", "可不可以", "有没有", "是不是"],
+    "hint": "知识库未命中的消息只有包含任一关键词才会被记录为未答问题，避免把普通闲聊也记进去。可根据实际情况增删。"
+  },
+  "list_limit": {
+    "description": "/未答列表 最多显示条数",
+    "type": "int",
+    "default": 20,
+    "hint": "每次查看未答列表最多显示多少条待处理记录，建议 10~50。"
+  }
+}
