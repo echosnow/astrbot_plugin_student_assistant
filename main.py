@@ -1,16 +1,20 @@
 """团学事务智能沟通小助手（astrbot_plugin_student_assistant）。
 
 设计定位：学生自助问答由 AstrBot 原生知识库（RAG）完成，本插件只补齐
-原生能力做不到的业务闭环，以"旁路监听"方式工作，不干扰原生问答体验：
+原生能力做不到的业务闭环，以"旁路监听"方式工作，不干扰原生问答体验。
+群聊与私聊（单聊）均可用，私聊场景数据以 private:<用户ID> 归档：
 
 1. 未答收集 —— 挂载 LLM 请求钩子，检查本次请求是否注入了知识库上下文。
-   未注入（即知识库没答上）且消息像提问时，自动记录到数据库，供管理员
-   通过 /未答列表 汇总处理，避免"机器人答不上来的问题石沉大海"。
-2. 链接入库 —— 管理员在群内发送 /加入知识库 <网页链接>，自动抓取网页
-   内容写入配置的知识库，无需打开 WebUI 上传文件。
-3. 沟通摘要 —— /整理（引用消息或回溯最近群聊），AI 整理老师意见、部门
+   未注入（即知识库没答上）、消息像提问且未命中已学会的问答时，自动
+   记录到数据库，并实时推送给已订阅推送的负责人，避免"机器人答不上来
+   的问题石沉大海"。
+2. 解答学会 —— /未答解决 <编号> <标准答案> 把解答登记为 FAQ；之后
+   相似问题会自动把参考答案注入 LLM 请求，实现"问过一次，下次就会"。
+3. 链接入库 —— 管理员发送 /加入知识库 <网页链接>，自动抓取网页内容
+   写入配置的知识库，无需打开 WebUI 上传文件。
+4. 沟通摘要 —— /整理（引用消息或回溯最近群聊），AI 整理老师意见、部门
    反馈、外院对接等多方沟通，提炼关键要求与待办事项，待办自动登记入清单。
-4. 待办同步 —— /记待办、/待办列表、/完成待办、/删待办、/同步待办 [老师]，
+5. 待办同步 —— /记待办、/待办列表、/完成待办、/删待办、/同步待办 [老师]，
    支持按同步对象（老师/同学）自动变换语气播报。
 """
 
@@ -26,6 +30,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import Plain, Reply
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
+from astrbot.core.message.message_event_result import MessageChain
 
 PLUGIN_NAME = "astrbot_plugin_student_assistant"
 
@@ -52,6 +57,12 @@ CACHE_TTL_HOURS = 48  # 超过此时长的缓存自动删除
 
 # /同步待办 单次最多播报条数
 SYNC_TODO_LIMIT = 20
+
+# FAQ 相似匹配阈值（问题 2-gram Jaccard 相似度），达到即视为"相似问题"
+FAQ_SIM_THRESHOLD = 0.4
+
+# FAQ 答案最长保留字符数
+MAX_ANSWER_LEN = 2000
 
 # 允许出现的截止时间字符（不含数字直接判空；超宽泛字符集做粗校验）
 _DEADLINE_PATTERN = re.compile(r"^[0-9A-Za-z\-/月日周点分秒时:：. ]{1,24}$")
@@ -84,6 +95,21 @@ def _normalize_text(text: str) -> str:
     return re.sub(
         r"[\s，。！？?!\.,:：;；、~～'\"“”‘’()（）【】\[\]{}]+", "", text
     ).lower()
+
+
+def _bigrams(text: str) -> set[str]:
+    """提取文本的 2-gram 集合（中文短文本相似度用）。"""
+    text = _normalize_text(text)
+    if len(text) < 2:
+        return {text} if text else set()
+    return {text[i : i + 2] for i in range(len(text) - 1)}
+
+
+def _jaccard(a: set[str], b: set[str]) -> float:
+    """两个集合的 Jaccard 相似度。"""
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
 
 
 def _clean_deadline(value: str) -> str:
@@ -190,6 +216,31 @@ class AssistantStore:
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_cached_msg "
             "ON cached_messages(group_id, msg_id)"
         )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS faq (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scope_id TEXT NOT NULL DEFAULT '',
+                question TEXT NOT NULL,
+                q_norm TEXT NOT NULL,
+                answer TEXT NOT NULL,
+                source_id INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_faq_norm ON faq(q_norm)"
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS push_targets (
+                umo TEXT PRIMARY KEY,
+                platform_name TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            )
+            """
+        )
         self._conn.commit()
 
     # ---------- 未答问题 ----------
@@ -249,16 +300,134 @@ class AssistantStore:
                 (group_id, limit),
             ).fetchall()
 
-    async def resolve_unanswered(self, record_id: int, group_id: str) -> bool:
-        """把一条未答问题标记为已处理。"""
+    async def resolve_unanswered(
+        self, record_id: int, group_id: str | None = None
+    ) -> sqlite3.Row | None:
+        """把一条未答问题标记为已处理，返回被处理的记录。
+
+        group_id 为 None（私聊管理员操作）时不校验归属，可处理任意来源；
+        群聊操作时仅允许处理本群记录。
+        """
+        async with self._lock:
+            if group_id is None:
+                row = self._conn.execute(
+                    "SELECT * FROM unanswered "
+                    "WHERE id = ? AND status = 'pending'",
+                    (record_id,),
+                ).fetchone()
+            else:
+                row = self._conn.execute(
+                    "SELECT * FROM unanswered "
+                    "WHERE id = ? AND group_id = ? AND status = 'pending'",
+                    (record_id, group_id),
+                ).fetchone()
+            if not row:
+                return None
+            self._conn.execute(
+                "UPDATE unanswered SET status = 'resolved', resolved_at = ? "
+                "WHERE id = ?",
+                (_fmt_time(_now_cst()), record_id),
+            )
+            self._conn.commit()
+            return row
+
+    # ---------- 已学会的问答（FAQ） ----------
+
+    async def add_faq(
+        self,
+        *,
+        scope_id: str,
+        question: str,
+        answer: str,
+        source_id: int = 0,
+        created_at: datetime,
+    ) -> tuple[int, bool]:
+        """登记/更新一条问答。同一问题已存在时更新答案。
+
+        返回 (编号, 是否为更新已有问答)。
+        """
+        question = question.strip()[:MAX_TEXT_LEN]
+        q_norm = _normalize_text(question)
+        answer = answer.strip()[:MAX_ANSWER_LEN]
+        if not q_norm or not answer:
+            return 0, False
+        async with self._lock:
+            row = self._conn.execute(
+                "SELECT id FROM faq WHERE q_norm = ?", (q_norm,)
+            ).fetchone()
+            if row:
+                self._conn.execute(
+                    "UPDATE faq SET answer = ?, scope_id = ?, source_id = ? "
+                    "WHERE id = ?",
+                    (answer, scope_id, source_id, row["id"]),
+                )
+                self._conn.commit()
+                return row["id"], True
+            cur = self._conn.execute(
+                "INSERT INTO faq (scope_id, question, q_norm, answer, "
+                "source_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    scope_id,
+                    question,
+                    q_norm,
+                    answer,
+                    source_id,
+                    _fmt_time(created_at),
+                ),
+            )
+            self._conn.commit()
+            return cur.lastrowid, False
+
+    async def list_faq(self, limit: int = 200) -> list[sqlite3.Row]:
+        """列出已学会的问答（新到旧）。"""
+        async with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM faq ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+
+    async def delete_faq(self, record_id: int) -> str | None:
+        """删除一条问答，返回被删问题（未找到返回 None）。"""
+        async with self._lock:
+            row = self._conn.execute(
+                "SELECT question FROM faq WHERE id = ?", (record_id,)
+            ).fetchone()
+            if not row:
+                return None
+            self._conn.execute("DELETE FROM faq WHERE id = ?", (record_id,))
+            self._conn.commit()
+            return row["question"]
+
+    # ---------- 未答推送订阅 ----------
+
+    async def add_push_target(
+        self, umo: str, platform_name: str, created_at: datetime
+    ) -> bool:
+        """订阅未答推送；已订阅时返回 False。"""
         async with self._lock:
             cur = self._conn.execute(
-                "UPDATE unanswered SET status = 'resolved', resolved_at = ? "
-                "WHERE id = ? AND group_id = ? AND status = 'pending'",
-                (_fmt_time(_now_cst()), record_id, group_id),
+                "INSERT OR IGNORE INTO push_targets (umo, platform_name, "
+                "created_at) VALUES (?, ?, ?)",
+                (umo, platform_name, _fmt_time(created_at)),
             )
             self._conn.commit()
             return cur.rowcount > 0
+
+    async def remove_push_target(self, umo: str) -> bool:
+        """取消订阅未答推送。"""
+        async with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM push_targets WHERE umo = ?", (umo,)
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    async def list_push_targets(self) -> list[str]:
+        """列出所有推送目标会话（unified_msg_origin）。"""
+        async with self._lock:
+            rows = self._conn.execute(
+                "SELECT umo FROM push_targets"
+            ).fetchall()
+            return [r["umo"] for r in rows]
 
     # ---------- 待办清单 ----------
 
@@ -531,6 +700,26 @@ class StudentAssistant(Star):
     def _is_onebot(self, event: AstrMessageEvent) -> bool:
         return str(event.platform_meta.name) == "aiocqhttp"
 
+    @staticmethod
+    def _check_scope(event: AstrMessageEvent) -> tuple[str, str]:
+        """确定事件归属：返回 (scope_id, "group"|"private")。
+
+        群聊返回群号（与历史数据兼容）；私聊返回 private:<用户ID>。
+        白名单校验用 _is_scope_allowed，私聊一律放行。
+        """
+        gid = str(event.get_group_id() or "").strip()
+        if gid:
+            return gid, "group"
+        sid = str(event.get_sender_id() or "").strip()
+        return f"private:{sid}", "private"
+
+    def _is_scope_allowed(self, event: AstrMessageEvent) -> bool:
+        """群聊校验白名单，私聊放行。"""
+        gid = str(event.get_group_id() or "").strip()
+        if not gid:
+            return True
+        return self._is_group_allowed(gid)
+
     # ---------- 未答收集（旁路监听，不影响原生问答） ----------
 
     @staticmethod
@@ -551,16 +740,43 @@ class StudentAssistant(Star):
             return True
 
     @filter.on_llm_request()
+    async def inject_faq(
+        self, event: AstrMessageEvent, req: ProviderRequest
+    ) -> None:
+        """LLM 请求钩子：命中已学会的问答时，把参考答案注入请求。
+
+        注意：只做旁路增强，绝不覆盖知识库检索结果，也不阻止事件流转。
+        """
+        try:
+            if not self._is_scope_allowed(event):
+                return
+            text = (event.message_str or "").strip()
+            if len(text) < MIN_QUESTION_LEN or text.startswith("/"):
+                return
+            row = await self._match_faq(text)
+            if not row:
+                return
+            ref = (
+                "\n\n【历史解答参考】此前有人问过类似问题："
+                f"「{row['question']}」，当时的标准解答如下，"
+                "回答时请优先参考：\n" + row["answer"]
+            )
+            req.system_prompt = (getattr(req, "system_prompt", "") or "") + ref
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"[团学助手] FAQ 注入异常: {e}")
+
+    @filter.on_llm_request()
     async def collect_unanswered(
         self, event: AstrMessageEvent, req: ProviderRequest
     ) -> None:
         """LLM 请求钩子：知识库未命中且消息像提问时，记录为未解答问题。
 
+        群聊与私聊均生效；命中已学会的问答（FAQ）的问题视为已覆盖，
+        不再记录。记录成功后实时推送给已订阅的负责人会话。
         注意：这里只做旁路记录，绝不修改请求，也不阻止事件流转。
         """
         try:
-            group_id = str(event.get_group_id() or "").strip()
-            if not group_id or not self._is_group_allowed(group_id):
+            if not self._is_scope_allowed(event):
                 return
 
             text = (event.message_str or "").strip()
@@ -568,11 +784,14 @@ class StudentAssistant(Star):
                 return
             if not any(k in text for k in self.question_keywords):
                 return
+            if await self._match_faq(text):
+                return  # 已学会的相似问题，视为能解答
             if self._kb_hit(req):
                 return
 
+            scope_id, scope_kind = self._check_scope(event)
             record_id = await self.store.add_unanswered(
-                group_id=group_id,
+                group_id=scope_id,
                 sender_id=str(event.get_sender_id() or ""),
                 sender_name=event.get_sender_name() or "",
                 question=text,
@@ -581,11 +800,74 @@ class StudentAssistant(Star):
             if record_id:
                 logger.info(
                     f"[团学助手] 记录未答问题 #{record_id}"
-                    f"（群 {group_id}）: {text[:50]}"
+                    f"（{scope_id}）: {text[:50]}"
+                )
+                await self._push_unanswered(
+                    record_id,
+                    event.get_sender_name() or "",
+                    text,
+                    scope_id,
+                    scope_kind,
                 )
         except Exception as e:  # noqa: BLE001
             # 收集失败不能影响机器人的正常回答流程
             logger.debug(f"[团学助手] 未答收集异常: {e}")
+
+    async def _match_faq(self, question: str) -> sqlite3.Row | None:
+        """在已学会的问答中找相似问题：先精确匹配，再做 2-gram 相似度。"""
+        q_norm = _normalize_text(question)
+        if len(q_norm) < 2:
+            return None
+        rows = await self.store.list_faq()
+        if not rows:
+            return None
+        grams_q = _bigrams(q_norm)
+        best, best_sim = None, 0.0
+        for r in rows:
+            f_norm = _normalize_text(r["question"])
+            if not f_norm:
+                continue
+            if q_norm == f_norm:
+                return r
+            sim = _jaccard(grams_q, _bigrams(f_norm))
+            if sim > best_sim:
+                best, best_sim = r, sim
+        return best if best_sim >= FAQ_SIM_THRESHOLD else None
+
+    async def _push_unanswered(
+        self,
+        record_id: int,
+        sender_name: str,
+        question: str,
+        scope_id: str,
+        scope_kind: str,
+    ) -> None:
+        """把新未答问题实时推送给已订阅的负责人会话。
+
+        单个目标推送失败（如官方机器人主动消息配额不足）只记日志，
+        不影响其他目标。
+        """
+        try:
+            targets = await self.store.list_push_targets()
+            if not targets:
+                return
+            source = "私聊" if scope_kind == "private" else f"群 {scope_id}"
+            text = (
+                f"📩 收到新的未答问题 #{record_id}（来源：{source}）\n"
+                f"提问人：{sender_name or '未知'}\n"
+                f"问题：{question}\n\n"
+                f"解答后回复：/未答解决 {record_id} <标准答案>\n"
+                f"（附上答案会被记住，下次相似问题可直接回答）\n"
+                f"查看全部：/未答列表"
+            )
+            chain = MessageChain(chain=[Plain(text)])
+            for umo in targets:
+                try:
+                    await self.context.send_message(umo, chain)
+                except Exception as e:  # noqa: BLE001
+                    logger.debug(f"[团学助手] 推送未答问题到 {umo} 失败: {e}")
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"[团学助手] 未答推送异常: {e}")
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def cache_group_message(self, event: AstrMessageEvent):
@@ -846,75 +1128,152 @@ class StudentAssistant(Star):
     # ---------- 管理员指令：未答收集 ----------
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    @filter.event_message_type(filter.EventMessageType.ALL)
     @filter.command("未答列表")
     async def list_unanswered_cmd(self, event: AstrMessageEvent):
-        """查看知识库无法解答的问题：/未答列表 [全部]"""
+        """查看知识库无法解答的问题：/未答列表 [全部]（私聊默认全部）"""
         event.stop_event()
-        group_id = str(event.get_group_id() or "").strip()
-        if not self._is_group_allowed(group_id):
+        if not self._is_scope_allowed(event):
             yield event.plain_result("本群未启用团学助手功能。")
             return
 
-        scope_all = "全部" in (event.message_str or "")
+        scope_id, scope_kind = self._check_scope(event)
+        scope_all = (
+            "全部" in (event.message_str or "") or scope_kind == "private"
+        )
         rows = await self.store.list_pending_unanswered(
-            None if scope_all else group_id, self.list_limit
+            None if scope_all else scope_id, self.list_limit
         )
         if not rows:
             yield event.plain_result("暂无待处理的未答问题，知识库覆盖良好。")
             return
 
-        scope = "全部群" if scope_all else "本群"
+        scope = "全部会话" if scope_all else "本群"
         lines = [f"未解答问题（{scope}，待处理 {len(rows)} 条）："]
         for r in rows:
             asked = (r["asked_at"] or "")[5:16]  # MM-DD HH:MM
+            origin = "私聊" if r["group_id"].startswith("private:") else "群聊"
             lines.append(
-                f"#{r['id']} [{asked}] "
+                f"#{r['id']} [{asked}][{origin}] "
                 f"{r['sender_name'] or r['sender_id']}：{r['question']}"
             )
-        lines.append("处理：/未答解决 <编号>；手动登记：/加入未答 <问题>")
+        lines.append(
+            "处理：/未答解决 <编号> [标准答案]；手动登记：/加入未答 <问题>"
+        )
         yield event.plain_result("\n".join(lines))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    @filter.event_message_type(filter.EventMessageType.ALL)
     @filter.command("未答解决")
     async def resolve_unanswered_cmd(self, event: AstrMessageEvent):
-        """标记一条未答问题为已处理：/未答解决 <编号>"""
+        """标记未答问题已处理并可学会答案：/未答解决 <编号> [标准答案]"""
         event.stop_event()
-        group_id = str(event.get_group_id() or "").strip()
-        if not self._is_group_allowed(group_id):
+        if not self._is_scope_allowed(event):
             yield event.plain_result("本群未启用团学助手功能。")
             return
 
-        parts = (event.message_str or "").split()
-        if len(parts) != 2 or not parts[1].isdigit():
+        scope_id, scope_kind = self._check_scope(event)
+        parts = (event.message_str or "").strip().split(maxsplit=2)
+        if len(parts) < 2 or not parts[1].isdigit():
             yield event.plain_result(
-                "用法：/未答解决 <编号>，编号可用 /未答列表 查看。"
+                "用法：/未答解决 <编号> [标准答案]\n"
+                "附上标准答案会被记住，下次相似问题直接回答。\n"
+                "编号可用 /未答列表 查看。"
             )
             return
         record_id = int(parts[1])
-        if await self.store.resolve_unanswered(record_id, group_id):
+        answer = parts[2].strip() if len(parts) > 2 else ""
+        row = await self.store.resolve_unanswered(
+            record_id, None if scope_kind == "private" else scope_id
+        )
+        if not row:
+            yield event.plain_result(
+                f"未找到待处理的 #{record_id}（群聊操作仅限本群记录，"
+                f"跨群问题请在私聊中处理）。"
+            )
+            return
+        if not answer:
             yield event.plain_result(f"已标记 #{record_id} 为已处理。")
+            return
+        faq_id, updated = await self.store.add_faq(
+            scope_id=row["group_id"],
+            question=row["question"],
+            answer=answer,
+            source_id=record_id,
+            created_at=_now_cst(),
+        )
+        if updated:
+            yield event.plain_result(
+                f"✅ #{record_id} 已处理，问答 #{faq_id} 的答案已更新，"
+                f"下次相似问题将自动参考。"
+            )
         else:
-            yield event.plain_result(f"本群未找到待处理的 #{record_id}。")
+            yield event.plain_result(
+                f"✅ #{record_id} 已处理，并已学会问答 #{faq_id}：\n"
+                f"问：{row['question']}\n"
+                f"下次遇到相似问题将自动参考该解答。"
+            )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    @filter.command("问答列表")
+    async def list_faq_cmd(self, event: AstrMessageEvent):
+        """查看已学会的问答：/问答列表"""
+        event.stop_event()
+        rows = await self.store.list_faq(self.list_limit)
+        if not rows:
+            yield event.plain_result(
+                "还没有学会任何问答。用 /未答解决 <编号> <标准答案> 教机器人。"
+            )
+            return
+        lines = [f"已学会的问答（共 {len(rows)} 条，相似问题自动参考）："]
+        for r in rows:
+            q = r["question"]
+            a = r["answer"]
+            if len(q) > 40:
+                q = q[:40] + "……"
+            if len(a) > 60:
+                a = a[:60] + "……"
+            lines.append(f"#{r['id']} 问：{q}\n　答：{a}")
+        lines.append("删除：/删问答 <编号>")
+        yield event.plain_result("\n".join(lines))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    @filter.command("删问答")
+    async def delete_faq_cmd(self, event: AstrMessageEvent):
+        """删除一条已学会的问答：/删问答 <编号>"""
+        event.stop_event()
+        parts = (event.message_str or "").split()
+        if len(parts) != 2 or not parts[1].isdigit():
+            yield event.plain_result(
+                "用法：/删问答 <编号>，编号可用 /问答列表 查看。"
+            )
+            return
+        record_id = int(parts[1])
+        question = await self.store.delete_faq(record_id)
+        if question:
+            yield event.plain_result(f"已删除问答 #{record_id}：{question}")
+        else:
+            yield event.plain_result(f"未找到 #{record_id} 的问答。")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.event_message_type(filter.EventMessageType.ALL)
     @filter.command("加入未答")
     async def add_unanswered_cmd(self, event: AstrMessageEvent):
         """手动登记一条待补资料的问题：/加入未答 <问题文字>"""
         event.stop_event()
-        group_id = str(event.get_group_id() or "").strip()
-        if not self._is_group_allowed(group_id):
+        if not self._is_scope_allowed(event):
             yield event.plain_result("本群未启用团学助手功能。")
             return
 
+        scope_id, _ = self._check_scope(event)
         parts = (event.message_str or "").strip().split(maxsplit=1)
         if len(parts) != 2 or not parts[1].strip():
             yield event.plain_result("用法：/加入未答 <问题文字>")
             return
         record_id = await self.store.add_unanswered(
-            group_id=group_id,
+            group_id=scope_id,
             sender_id=str(event.get_sender_id() or ""),
             sender_name=event.get_sender_name() or "",
             question=parts[1].strip(),
@@ -923,10 +1282,45 @@ class StudentAssistant(Star):
         if record_id is None:
             yield event.plain_result("该问题已在待处理列表中，无需重复登记。")
         else:
-            yield event.plain_result(f"已登记未答问题 #{record_id}。")
+            yield event.plain_result(
+                f"已登记未答问题 #{record_id}。\n"
+                f"订阅推送的负责人会收到提醒（/开启未答推送）。"
+            )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    @filter.command("开启未答推送")
+    async def enable_push_cmd(self, event: AstrMessageEvent):
+        """订阅未答问题实时推送：/开启未答推送（推荐在私聊中使用）"""
+        event.stop_event()
+        added = await self.store.add_push_target(
+            event.unified_msg_origin,
+            str(event.platform_meta.name),
+            _now_cst(),
+        )
+        if added:
+            yield event.plain_result(
+                "✅ 已订阅：学生提出机器人答不上的问题时，"
+                "本会话将实时收到提醒。\n"
+                "解答时回复 /未答解决 <编号> <标准答案> 即可让机器人学会。\n"
+                "取消订阅：/关闭未答推送"
+            )
+        else:
+            yield event.plain_result("本会话已订阅过未答推送，无需重复开启。")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    @filter.command("关闭未答推送")
+    async def disable_push_cmd(self, event: AstrMessageEvent):
+        """取消订阅未答问题推送：/关闭未答推送"""
+        event.stop_event()
+        if await self.store.remove_push_target(event.unified_msg_origin):
+            yield event.plain_result("已取消本会话的未答推送。")
+        else:
+            yield event.plain_result("本会话尚未订阅未答推送。")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.event_message_type(filter.EventMessageType.ALL)
     @filter.command("加入知识库")
     async def ingest_url_cmd(self, event: AstrMessageEvent):
         """抓取网页内容加入知识库：/加入知识库 <网页链接>"""
@@ -974,7 +1368,7 @@ class StudentAssistant(Star):
             )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    @filter.event_message_type(filter.EventMessageType.ALL)
     @filter.command("知识库状态")
     async def kb_status_cmd(self, event: AstrMessageEvent):
         """查看知识库配置状态：/知识库状态"""
@@ -1026,22 +1420,27 @@ class StudentAssistant(Star):
     # ---------- 管理员指令：沟通摘要 ----------
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    @filter.event_message_type(filter.EventMessageType.ALL)
     @filter.command("整理")
     async def summarize_cmd(self, event: AstrMessageEvent):
-        """AI 整理沟通记录：引用消息发 /整理，或直接 /整理 回溯最近群聊"""
+        """AI 整理沟通记录：引用消息发 /整理，群聊也可直接 /整理 回溯最近群聊"""
         event.stop_event()
-        group_id = str(event.get_group_id() or "").strip()
-        if not self._is_group_allowed(group_id):
+        if not self._is_scope_allowed(event):
             yield event.plain_result("本群未启用团学助手功能。")
             return
 
-        quoted = await self._get_quoted_text(event, group_id)
+        scope_id, scope_kind = self._check_scope(event)
+        quoted = await self._get_quoted_text(event, scope_id)
         if quoted:
             transcript, source = quoted, "引用消息"
+        elif scope_kind == "private":
+            yield event.plain_result(
+                "私聊整理仅支持引用消息：请先引用要分析的消息，再发送 /整理。"
+            )
+            return
         else:
             transcript = await self._build_recent_transcript(
-                event, group_id, self.summary_count
+                event, scope_id, self.summary_count
             )
             source = f"最近群聊（≤{self.summary_count} 条）"
             if not transcript:
@@ -1063,7 +1462,7 @@ class StudentAssistant(Star):
             yield event.plain_result("AI 整理失败，请稍后重试或查看日志。")
             return
 
-        registered = await self._register_todos(event, group_id, todos, "summary")
+        registered = await self._register_todos(event, scope_id, todos, "summary")
 
         text = f"📋 沟通摘要（来源：{source}）\n\n{summary}"
         if registered:
@@ -1075,28 +1474,28 @@ class StudentAssistant(Star):
         yield event.plain_result(text)
 
         if registered and self.auto_sync:
-            sync_msg = await self._build_sync(event, group_id, "同学")
+            sync_msg = await self._build_sync(event, scope_id, "同学")
             if sync_msg:
                 yield event.plain_result(sync_msg)
 
     # ---------- 管理员指令：待办清单 ----------
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    @filter.event_message_type(filter.EventMessageType.ALL)
     @filter.command("记待办")
     async def add_todo_cmd(self, event: AstrMessageEvent):
         """登记待办：/记待办 <事项文字>；或引用消息发 /记待办 由 AI 提取"""
         event.stop_event()
-        group_id = str(event.get_group_id() or "").strip()
-        if not self._is_group_allowed(group_id):
+        if not self._is_scope_allowed(event):
             yield event.plain_result("本群未启用团学助手功能。")
             return
 
+        scope_id, _ = self._check_scope(event)
         arg = ""
         parts = (event.message_str or "").strip().split(maxsplit=1)
         if len(parts) > 1:
             arg = parts[1].strip()
-        quoted = await self._get_quoted_text(event, group_id)
+        quoted = await self._get_quoted_text(event, scope_id)
 
         if not arg and not quoted:
             yield event.plain_result(
@@ -1122,7 +1521,7 @@ class StudentAssistant(Star):
                 yield event.plain_result("引用内容中没有识别到待办事项。")
                 return
             registered = await self._register_todos(
-                event, group_id, todos, "quoted"
+                event, scope_id, todos, "quoted"
             )
             if not registered:
                 yield event.plain_result("提取到的待办已在清单中，未重复登记。")
@@ -1133,14 +1532,14 @@ class StudentAssistant(Star):
             lines.append("查看：/待办列表 ｜ 同步：/同步待办")
             yield event.plain_result("\n".join(lines))
             if self.auto_sync:
-                sync_msg = await self._build_sync(event, group_id, "同学")
+                sync_msg = await self._build_sync(event, scope_id, "同学")
                 if sync_msg:
                     yield event.plain_result(sync_msg)
             return
 
         # 直接文字登记
         record_id = await self.store.add_todo(
-            group_id=group_id,
+            group_id=scope_id,
             content=arg,
             source="manual",
             creator_name=event.get_sender_name() or "",
@@ -1152,24 +1551,26 @@ class StudentAssistant(Star):
         yield event.plain_result(f"✅ 已登记待办 #{record_id}：{arg}")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    @filter.event_message_type(filter.EventMessageType.ALL)
     @filter.command("待办列表")
     async def list_todo_cmd(self, event: AstrMessageEvent):
-        """查看待办清单：/待办列表 [全部]"""
+        """查看待办清单：/待办列表 [全部]（私聊默认本会话）"""
         event.stop_event()
-        group_id = str(event.get_group_id() or "").strip()
-        if not self._is_group_allowed(group_id):
+        if not self._is_scope_allowed(event):
             yield event.plain_result("本群未启用团学助手功能。")
             return
 
+        scope_id, scope_kind = self._check_scope(event)
         scope_all = "全部" in (event.message_str or "")
         rows = await self.store.list_pending_todos(
-            None if scope_all else group_id, self.list_limit
+            None if scope_all else scope_id, self.list_limit
         )
         if not rows:
             yield event.plain_result("当前没有待处理的待办事项。")
             return
-        scope = "全部群" if scope_all else "本群"
+        scope = "全部会话" if scope_all else (
+            "私聊" if scope_kind == "private" else "本群"
+        )
         lines = [f"待办清单（{scope}，共 {len(rows)} 项）："]
         for r in rows:
             extra = []
@@ -1185,16 +1586,16 @@ class StudentAssistant(Star):
         yield event.plain_result("\n".join(lines))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    @filter.event_message_type(filter.EventMessageType.ALL)
     @filter.command("完成待办")
     async def finish_todo_cmd(self, event: AstrMessageEvent):
         """把一条待办标记为已完成：/完成待办 <编号>"""
         event.stop_event()
-        group_id = str(event.get_group_id() or "").strip()
-        if not self._is_group_allowed(group_id):
+        if not self._is_scope_allowed(event):
             yield event.plain_result("本群未启用团学助手功能。")
             return
 
+        scope_id, _ = self._check_scope(event)
         parts = (event.message_str or "").split()
         if len(parts) != 2 or not parts[1].isdigit():
             yield event.plain_result(
@@ -1202,22 +1603,22 @@ class StudentAssistant(Star):
             )
             return
         record_id = int(parts[1])
-        if await self.store.finish_todo(record_id, group_id):
+        if await self.store.finish_todo(record_id, scope_id):
             yield event.plain_result(f"✅ 待办 #{record_id} 已完成。")
         else:
-            yield event.plain_result(f"本群未找到待处理的 #{record_id}。")
+            yield event.plain_result(f"本会话未找到待处理的 #{record_id}。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    @filter.event_message_type(filter.EventMessageType.ALL)
     @filter.command("删待办")
     async def delete_todo_cmd(self, event: AstrMessageEvent):
         """删除一条待办：/删待办 <编号>"""
         event.stop_event()
-        group_id = str(event.get_group_id() or "").strip()
-        if not self._is_group_allowed(group_id):
+        if not self._is_scope_allowed(event):
             yield event.plain_result("本群未启用团学助手功能。")
             return
 
+        scope_id, _ = self._check_scope(event)
         parts = (event.message_str or "").split()
         if len(parts) != 2 or not parts[1].isdigit():
             yield event.plain_result(
@@ -1225,28 +1626,28 @@ class StudentAssistant(Star):
             )
             return
         record_id = int(parts[1])
-        content = await self.store.delete_todo(record_id, group_id)
+        content = await self.store.delete_todo(record_id, scope_id)
         if content:
             yield event.plain_result(f"已删除待办 #{record_id}：{content}")
         else:
-            yield event.plain_result(f"本群未找到 #{record_id} 的待办。")
+            yield event.plain_result(f"本会话未找到 #{record_id} 的待办。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    @filter.event_message_type(filter.EventMessageType.ALL)
     @filter.command("同步待办")
     async def sync_todo_cmd(self, event: AstrMessageEvent):
         """把待办清单按对象同步播报到群里：/同步待办 [老师]"""
         event.stop_event()
-        group_id = str(event.get_group_id() or "").strip()
-        if not self._is_group_allowed(group_id):
+        if not self._is_scope_allowed(event):
             yield event.plain_result("本群未启用团学助手功能。")
             return
 
+        scope_id, _ = self._check_scope(event)
         parts = (event.message_str or "").split()
         audience = (
             "老师" if any("老师" in p for p in parts[1:]) else "同学"
         )
-        msg = await self._build_sync(event, group_id, audience)
+        msg = await self._build_sync(event, scope_id, audience)
         if not msg:
             yield event.plain_result("当前没有待同步的待办事项。")
             return
