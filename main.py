@@ -241,6 +241,25 @@ class AssistantStore:
             )
             """
         )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS roles (
+                qq TEXT PRIMARY KEY,
+                name TEXT NOT NULL DEFAULT '',
+                role TEXT NOT NULL DEFAULT '',
+                is_lead INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        # 旧库迁移：unanswered 补充提问者会话字段（用于解答后主动回复）
+        try:
+            self._conn.execute(
+                "ALTER TABLE unanswered "
+                "ADD COLUMN asker_umo TEXT NOT NULL DEFAULT ''"
+            )
+        except sqlite3.OperationalError:
+            pass  # 列已存在
         self._conn.commit()
 
     # ---------- 未答问题 ----------
@@ -253,6 +272,7 @@ class AssistantStore:
         sender_name: str,
         question: str,
         asked_at: datetime,
+        asker_umo: str = "",
     ) -> int | None:
         """记录一条未答问题。同群同问题在去重窗口内已存在时返回 None。"""
         question = question.strip()[:MAX_TEXT_LEN]
@@ -270,7 +290,8 @@ class AssistantStore:
                 return None
             cur = self._conn.execute(
                 "INSERT INTO unanswered (group_id, sender_id, sender_name, "
-                "question, q_norm, asked_at) VALUES (?, ?, ?, ?, ?, ?)",
+                "question, q_norm, asked_at, asker_umo) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
                     group_id,
                     sender_id,
@@ -278,6 +299,7 @@ class AssistantStore:
                     question,
                     q_norm,
                     _fmt_time(asked_at),
+                    asker_umo,
                 ),
             )
             self._conn.commit()
@@ -428,6 +450,35 @@ class AssistantStore:
                 "SELECT umo FROM push_targets"
             ).fetchall()
             return [r["umo"] for r in rows]
+
+    # ---------- 角色映射（好友备注 → 角色/负责人） ----------
+
+    async def replace_roles(self, roles: list[dict]) -> None:
+        """整体刷新角色映射表（/同步角色 时调用）。"""
+        async with self._lock:
+            self._conn.execute("DELETE FROM roles")
+            self._conn.executemany(
+                "INSERT INTO roles (qq, name, role, is_lead, updated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                [
+                    (
+                        r["qq"],
+                        r["name"],
+                        r["role"],
+                        int(r["is_lead"]),
+                        r["updated_at"],
+                    )
+                    for r in roles
+                ],
+            )
+            self._conn.commit()
+
+    async def list_roles(self) -> list[sqlite3.Row]:
+        """列出全部角色映射，负责人排前。"""
+        async with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM roles ORDER BY role, is_lead DESC, name"
+            ).fetchall()
 
     # ---------- 待办清单 ----------
 
@@ -796,6 +847,7 @@ class StudentAssistant(Star):
                 sender_name=event.get_sender_name() or "",
                 question=text,
                 asked_at=_now_cst(),
+                asker_umo=str(event.unified_msg_origin or ""),
             )
             if record_id:
                 logger.info(
@@ -1202,16 +1254,35 @@ class StudentAssistant(Star):
             source_id=record_id,
             created_at=_now_cst(),
         )
+        # 解答后主动回复提问者（仅新记录有会话；失败不影响主流程）
+        reply_note = ""
+        asker_umo = (row["asker_umo"] or "").strip()
+        if asker_umo:
+            try:
+                notice = MessageChain(
+                    chain=[
+                        Plain(
+                            "【问题解答】你之前咨询的问题已有答复：\n"
+                            f"问：{row['question']}\n"
+                            f"答：{answer}"
+                        )
+                    ]
+                )
+                await self.context.send_message(asker_umo, notice)
+                reply_note = "\n已把解答发送给提问者。"
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"[团学助手] 回复提问者失败: {e}")
+                reply_note = "\n（提问者发送失败，解答已记住，下次可直接回答）"
         if updated:
             yield event.plain_result(
                 f"✅ #{record_id} 已处理，问答 #{faq_id} 的答案已更新，"
-                f"下次相似问题将自动参考。"
+                f"下次相似问题将自动参考。{reply_note}"
             )
         else:
             yield event.plain_result(
                 f"✅ #{record_id} 已处理，并已学会问答 #{faq_id}：\n"
                 f"问：{row['question']}\n"
-                f"下次遇到相似问题将自动参考该解答。"
+                f"下次遇到相似问题将自动参考该解答。{reply_note}"
             )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -1278,6 +1349,7 @@ class StudentAssistant(Star):
             sender_name=event.get_sender_name() or "",
             question=parts[1].strip(),
             asked_at=_now_cst(),
+            asker_umo=str(event.unified_msg_origin or ""),
         )
         if record_id is None:
             yield event.plain_result("该问题已在待处理列表中，无需重复登记。")
@@ -1318,6 +1390,95 @@ class StudentAssistant(Star):
             yield event.plain_result("已取消本会话的未答推送。")
         else:
             yield event.plain_result("本会话尚未订阅未答推送。")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    @filter.command("同步角色")
+    async def sync_roles_cmd(self, event: AstrMessageEvent):
+        """从机器人 QQ 好友备注刷新角色映射：/同步角色
+
+        备注格式：角色-姓名（如 老师-王老师、组织-张三）；
+        姓名后加 * 表示该部门负责人（如 组织-张三*）。
+        """
+        event.stop_event()
+        if not self._is_scope_allowed(event):
+            yield event.plain_result("本群未启用团学助手功能。")
+            return
+        if not self._is_onebot(event):
+            yield event.plain_result(
+                "当前平台不支持读取好友备注，仅 NapCat(aiocqhttp) 平台支持。"
+            )
+            return
+        bot = getattr(event, "bot", None)
+        if bot is None:
+            yield event.plain_result(
+                "无法访问 OneBot 客户端，请确认 NapCat 连接正常。"
+            )
+            return
+        try:
+            friends = await bot.get_friend_list()
+        except Exception as e:  # noqa: BLE001
+            yield event.plain_result(f"读取好友列表失败：{e}")
+            return
+
+        roles: list[dict] = []
+        skipped = 0
+        now = _fmt_time(_now_cst())
+        for f in friends or []:
+            remark = (f.get("remark") or "").strip()
+            qq = str(f.get("user_id") or "").strip()
+            if not qq:
+                continue
+            if "-" not in remark:
+                if remark:
+                    skipped += 1
+                continue
+            role, _, name = remark.partition("-")
+            role, name = role.strip(), name.strip()
+            is_lead = name.endswith("*")
+            if is_lead:
+                name = name[:-1].strip()
+            if not role or not name:
+                skipped += 1
+                continue
+            roles.append(
+                {
+                    "qq": qq,
+                    "name": name,
+                    "role": role,
+                    "is_lead": is_lead,
+                    "updated_at": now,
+                }
+            )
+
+        await self.store.replace_roles(roles)
+        if not roles:
+            yield event.plain_result(
+                "未解析到任何角色备注。\n"
+                "请按「角色-姓名」格式给机器人好友设置备注"
+                "（如 老师-王老师、组织-张三），部门负责人在姓名后加 *"
+                "（如 组织-张三*），完成后重新发送 /同步角色。"
+            )
+            return
+
+        grouped: dict[str, list[dict]] = {}
+        for r in roles:
+            grouped.setdefault(r["role"], []).append(r)
+        lines = [f"✅ 已同步 {len(roles)} 名成员的角色映射："]
+        for role, members in grouped.items():
+            names = [
+                f"{m['name']}（负责人）" if m["is_lead"] else m["name"]
+                for m in members
+            ]
+            lines.append(f"· {role}：{'、'.join(names)}")
+        if skipped:
+            lines.append(f"另有 {skipped} 名好友备注格式不符，已跳过。")
+        if not any(m["is_lead"] for m in roles):
+            lines.append(
+                "提示：未标记任何部门负责人（姓名后加 *），"
+                "部门类待办将无法精准推送。"
+            )
+        yield event.plain_result("\n".join(lines))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.event_message_type(filter.EventMessageType.ALL)
@@ -1474,7 +1635,7 @@ class StudentAssistant(Star):
         yield event.plain_result(text)
 
         if registered and self.auto_sync:
-            sync_msg = await self._build_sync(event, scope_id, "同学")
+            sync_msg = await self._dispatch_todos(event, scope_id)
             if sync_msg:
                 yield event.plain_result(sync_msg)
 
@@ -1532,7 +1693,7 @@ class StudentAssistant(Star):
             lines.append("查看：/待办列表 ｜ 同步：/同步待办")
             yield event.plain_result("\n".join(lines))
             if self.auto_sync:
-                sync_msg = await self._build_sync(event, scope_id, "同学")
+                sync_msg = await self._dispatch_todos(event, scope_id)
                 if sync_msg:
                     yield event.plain_result(sync_msg)
             return
@@ -1636,7 +1797,8 @@ class StudentAssistant(Star):
     @filter.event_message_type(filter.EventMessageType.ALL)
     @filter.command("同步待办")
     async def sync_todo_cmd(self, event: AstrMessageEvent):
-        """把待办清单按对象同步播报到群里：/同步待办 [老师]"""
+        """同步待办：/同步待办 按归属私聊推送（未识别的发群里）；
+        /同步待办 老师 生成整份正式语气文案供手动转发。"""
         event.stop_event()
         if not self._is_scope_allowed(event):
             yield event.plain_result("本群未启用团学助手功能。")
@@ -1644,14 +1806,143 @@ class StudentAssistant(Star):
 
         scope_id, _ = self._check_scope(event)
         parts = (event.message_str or "").split()
-        audience = (
-            "老师" if any("老师" in p for p in parts[1:]) else "同学"
-        )
-        msg = await self._build_sync(event, scope_id, audience)
-        if not msg:
-            yield event.plain_result("当前没有待同步的待办事项。")
+
+        # 带「老师」参数：保持旧行为，整份正式文案发在当前会话
+        if any("老师" in p for p in parts[1:]):
+            msg = await self._build_sync(event, scope_id, "老师")
+            if not msg:
+                yield event.plain_result("当前没有待同步的待办事项。")
+                return
+            yield event.plain_result(msg)
             return
-        yield event.plain_result(msg)
+
+        msg = await self._dispatch_todos(event, scope_id)
+        yield event.plain_result(msg or "当前没有待同步的待办事项。")
+
+    async def _dispatch_todos(
+        self, event: AstrMessageEvent, scope_id: str
+    ) -> str | None:
+        """把待办按归属私聊推送给接收人，返回群内的汇总报告文本。
+
+        匹配优先级：人名 > 部门负责人；未匹配的待办列入群内文案。
+        """
+        rows = await self.store.list_pending_todos(scope_id, SYNC_TODO_LIMIT)
+        if not rows:
+            return None
+        roles = await self.store.list_roles()
+
+        pushed: list[str] = []
+        failed: list[str] = []
+        unmatched: list[sqlite3.Row] = []
+        for todo in rows:
+            owner = (
+                self._find_owner(f"{todo['content']} {todo['assignee']}", roles)
+                if roles
+                else None
+            )
+            if owner is None:
+                unmatched.append(todo)
+                continue
+            ok = await self._push_todo_to_owner(event, todo, owner)
+            (pushed if ok else failed).append(owner["name"])
+
+        lines: list[str] = []
+        if pushed:
+            names = "、".join(dict.fromkeys(pushed))
+            lines.append(f"✅ 已私聊同步给：{names}")
+        if failed:
+            names = "、".join(dict.fromkeys(failed))
+            lines.append(f"⚠️ 推送失败（对方可能未加好友或触发风控）：{names}")
+        if unmatched:
+            lines.append(
+                f"以下 {len(unmatched)} 条未识别到接收人，请大家自行认领："
+            )
+            for t in unmatched:
+                extra = []
+                if t["deadline"]:
+                    extra.append(f"截止 {t['deadline']}")
+                if t["assignee"]:
+                    extra.append(f"负责 {t['assignee']}")
+                suffix = f"（{'｜'.join(extra)}）" if extra else ""
+                lines.append(f"{t['id']}. {t['content']}{suffix}")
+        if not roles:
+            lines.append(
+                "（未配置角色映射：在机器人 QQ 上按「角色-姓名」给好友设备注，"
+                "部门负责人姓名后加 *，然后发 /同步角色，即可自动私聊同步）"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _find_owner(
+        todo_text: str, roles: list[sqlite3.Row]
+    ) -> sqlite3.Row | None:
+        """按"人名优先、部门负责人其次"在角色映射中找待办接收人。"""
+        # 人名匹配（2 字及以上才参与，避免单字误命中）
+        for r in roles:
+            name = r["name"]
+            if len(name) >= 2 and name in todo_text:
+                return r
+        # 部门匹配：命中后推给该部门标记的负责人
+        seen: set[str] = set()
+        for r in roles:
+            role = r["role"]
+            if not role or role in seen:
+                continue
+            seen.add(role)
+            if role in todo_text or f"{role}部" in todo_text:
+                for m in roles:
+                    if m["role"] == role and m["is_lead"]:
+                        return m
+        return None
+
+    async def _push_todo_to_owner(
+        self, event: AstrMessageEvent, todo: sqlite3.Row, owner: sqlite3.Row
+    ) -> bool:
+        """把单条待办私聊推送给归属人（语气按角色），返回是否成功。"""
+        audience = "老师" if owner["role"] == "老师" else "同学"
+        text = await self._build_single_sync(event, todo, audience)
+        # umo 第一段即当前平台实例 ID，私聊会话类型为 FriendMessage
+        platform_id = str(event.unified_msg_origin).split(":", 1)[0]
+        umo = f"{platform_id}:FriendMessage:{owner['qq']}"
+        try:
+            await self.context.send_message(
+                umo, MessageChain(chain=[Plain(text)])
+            )
+            return True
+        except Exception as e:  # noqa: BLE001
+            logger.debug(
+                f"[团学助手] 推送待办 #{todo['id']} 到 "
+                f"{owner['name']}({owner['qq']}) 失败: {e}"
+            )
+            return False
+
+    async def _build_single_sync(
+        self, event: AstrMessageEvent, todo: sqlite3.Row, audience: str
+    ) -> str:
+        """生成单条待办的同步文案：AI 按角色改写语气，失败退回纯文本。"""
+        extra = []
+        if todo["deadline"]:
+            extra.append(f"截止 {todo['deadline']}")
+        if todo["assignee"]:
+            extra.append(f"负责 {todo['assignee']}")
+        suffix = f"（{'｜'.join(extra)}）" if extra else ""
+        plain = f"【待办同步】共 1 项\n{todo['id']}. {todo['content']}{suffix}"
+
+        provider_id = await self._get_provider_id(event)
+        if provider_id:
+            try:
+                resp = await self.context.llm_generate(
+                    chat_provider_id=provider_id,
+                    prompt=self.SYNC_PROMPT.format(
+                        plain=plain, audience=audience
+                    ),
+                )
+                text = (getattr(resp, "completion_text", "") or "").strip()
+                if text:
+                    return text
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"[团学助手] 单条同步改写失败，使用纯文本: {e}")
+        return plain
 
     async def _build_sync(
         self, event: AstrMessageEvent, group_id: str, audience: str
